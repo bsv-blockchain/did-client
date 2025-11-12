@@ -78,7 +78,7 @@ export class DIDClient {
 
     // 2. Build a PushDrop locking script
     const lockingScript = await new PushDrop(wallet).lock(
-      Utils.toArray(serialNumber, 'base64'),
+      [Utils.toArray(serialNumber, 'base64')],
       PROTOCOL_ID,
       `${derivationPrefix} ${derivationSuffix}`,
       subject
