@@ -2,6 +2,7 @@ import {
   Base64String,
   BroadcastFailure,
   BroadcastResponse,
+  ListOutputsResult,
   LookupAnswer,
   LookupResolver,
   PubKeyHex,
@@ -12,6 +13,7 @@ import {
   Utils,
   WalletClient,
   WalletInterface,
+  WalletOutput,
   WalletProtocol
 } from '@bsv/sdk'
 import { DIDRecord, DIDQuery } from './types/index.js'
@@ -92,7 +94,10 @@ export class DIDClient {
         satoshis: 1,
         outputDescription: 'DID token',
         basket: 'did',
-        tags: [`did-token-${subject}`],
+        tags: [
+          `did-token-${subject}`,
+          `did-serial-${serialNumber}`
+        ],
         customInstructions: JSON.stringify({
           derivationPrefix,
           derivationSuffix
@@ -177,21 +182,111 @@ export class DIDClient {
 
   /* ──────────────────────────────  Revoke  ───────────────────────────── */
   /**
-   * Revokes a DID token by spending it to fees (effectively burning it).
+   * Revokes a DID token by serial number or outpoint.
+   * Handles all the complexity of finding the token, getting BEEF, and spending it.
+   * 
+   * @param opts Revocation options
+   * @param opts.serialNumber The serial number of the DID token (preferred method)
+   * @param opts.outpoint The outpoint of the DID token (fallback method)
+   * @returns The overlay broadcast response or failure
    */
-  async revokeDID(
-    prev: DIDRecord & { beef: number[] },
-    subject: PubKeyHex,
-    opts: { wallet?: WalletInterface, derivationPrefix?: Base64String, derivationSuffix?: Base64String } = {}
-  ): Promise<BroadcastResponse | BroadcastFailure> {
-    const wallet = opts.wallet ?? this.wallet
-    const prevOutpoint = `${prev.txid}.${prev.outputIndex}` as const
+  async revokeDID(opts: {
+    serialNumber?: string
+    outpoint?: string
+  }): Promise<BroadcastResponse | BroadcastFailure> {
+    const { serialNumber, outpoint } = opts
 
-    const { signableTransaction } = await wallet.createAction({
+    // 1. Find the DID token in wallet
+    let walletOutputs: ListOutputsResult
+    if (serialNumber) {
+      // Use serial number tag for direct lookup
+      walletOutputs = await this.wallet.listOutputs({
+        basket: 'did',
+        tags: [`did-serial-${serialNumber}`],
+        includeTags: true,
+        includeCustomInstructions: true,
+        include: 'entire transactions'
+      })
+    } else if (outpoint) {
+      // If no serial number is provided, get all DID outputs and filter by outpoint
+      walletOutputs = await this.wallet.listOutputs({
+        basket: 'did',
+        tags: [],
+        includeTags: true,
+        includeCustomInstructions: true,
+        include: 'entire transactions'
+      })
+
+      // Filter to only the matching outpoint
+      const matchingOutput: WalletOutput = walletOutputs.outputs.find((o: any) => o.outpoint === outpoint)
+      if (matchingOutput) {
+        walletOutputs.outputs = [matchingOutput]
+      } else {
+        walletOutputs.outputs = []
+      }
+    } else {
+      return {
+        status: 'error',
+        code: 'ERR_MISSING_IDENTIFIER',
+        description: 'Either serialNumber or outpoint must be provided'
+      }
+    }
+
+    if (walletOutputs.outputs.length === 0) {
+      return {
+        status: 'error',
+        code: 'ERR_DID_NOT_FOUND',
+        description: 'DID token not found in wallet'
+      }
+    }
+
+    const output = walletOutputs.outputs[0]
+    if (!output.customInstructions) {
+      return {
+        status: 'error',
+        code: 'ERR_MISSING_INSTRUCTIONS',
+        description: 'DID token missing derivation parameters'
+      }
+    }
+
+    if (!walletOutputs.BEEF) {
+      return {
+        status: 'error',
+        code: 'ERR_NO_BEEF',
+        description: 'DID token BEEF data not available from wallet'
+      }
+    }
+
+    // 2. Extract derivation parameters
+    let derivationPrefix: Base64String
+    let derivationSuffix: Base64String
+    try {
+      const instructions = JSON.parse(output.customInstructions)
+      derivationPrefix = instructions.derivationPrefix
+      derivationSuffix = instructions.derivationSuffix
+    } catch (e) {
+      return {
+        status: 'error',
+        code: 'ERR_INVALID_INSTRUCTIONS',
+        description: 'Unable to parse DID derivation parameters'
+      }
+    }
+
+    const subject = output.tags?.find((tag: string) => tag.startsWith('did-subject-'))
+    if (!subject) {
+      return {
+        status: 'error',
+        code: 'ERR_MISSING_SUBJECT',
+        description: 'DID token missing subject public key'
+      }
+    }
+
+    // 3. Spend the DID token to revoke it
+    const { signableTransaction } = await this.wallet.createAction({
       description: 'Revoke DID',
-      inputBEEF: prev.beef,
+      inputBEEF: walletOutputs.BEEF,
       inputs: [{
-        outpoint: prevOutpoint,
+        outpoint: output.outpoint,
         unlockingScriptLength: 74,
         inputDescription: 'Redeem DID token'
       }],
@@ -199,14 +294,14 @@ export class DIDClient {
     })
     if (!signableTransaction) throw new Error('Unable to build DID revoke transaction')
 
-    const unlocker = new PushDrop(wallet).unlock(
+    const unlocker = new PushDrop(this.wallet).unlock(
       PROTOCOL_ID,
-      `${opts.derivationPrefix} ${opts.derivationSuffix}`,
+      `${derivationPrefix} ${derivationSuffix}`,
       subject
     )
     const unlockingScript = await unlocker.sign(Transaction.fromBEEF(signableTransaction.tx), 0)
 
-    const { tx } = await wallet.signAction({
+    const { tx } = await this.wallet.signAction({
       reference: signableTransaction.reference,
       spends: { 0: { unlockingScript: unlockingScript.toHex() } }
     })
