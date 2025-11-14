@@ -95,8 +95,8 @@ export class DIDClient {
         outputDescription: 'DID token',
         basket: 'did',
         tags: [
-          `did-token-${subject}`,
-          `did-serial-${serialNumber}`
+          `did-token-subject-${subject}`,
+          `did-token-serialNumber-${serialNumber}`
         ],
         customInstructions: JSON.stringify({
           derivationPrefix,
@@ -202,7 +202,7 @@ export class DIDClient {
       // Use serial number tag for direct lookup
       walletOutputs = await this.wallet.listOutputs({
         basket: 'did',
-        tags: [`did-serial-${serialNumber}`],
+        tags: [`did-token-serialNumber-${serialNumber}`],
         includeTags: true,
         includeCustomInstructions: true,
         include: 'entire transactions'
@@ -272,7 +272,11 @@ export class DIDClient {
       }
     }
 
-    const subject = output.tags?.find((tag: string) => tag.startsWith('did-subject-'))
+    const subjectTag = output.tags?.find((tag: string) =>
+      tag.startsWith('did-token-subject-')
+    )
+    const subject = subjectTag?.substring('did-token-subject-'.length)
+
     if (!subject) {
       return {
         status: 'error',
@@ -367,10 +371,7 @@ export class DIDClient {
       if (decoded.fields.length < 1) throw new Error('Invalid DID token: missing serial number')
 
       // Convert serial bytes → Base64 string
-      const serialBytes = decoded.fields[0] as number[]
-      const serialNumber = Utils.toBase64
-        ? (Utils.toBase64(serialBytes) as string)
-        : Buffer.from(serialBytes).toString('base64')
+      const serialNumber = Utils.toBase64(decoded.fields[0] as number[])
 
       return {
         txid: tx.id('hex'),
